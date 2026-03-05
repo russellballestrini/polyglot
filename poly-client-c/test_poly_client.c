@@ -268,6 +268,94 @@ static void test_serialization_roundtrip(void) {
     pc_client_free(c);
 }
 
+static void test_client_reuse(void) {
+    /* Same client used for multiple sequential requests */
+    pc_client_t *c = pc_client_new("test-model", PV_MODE_ENCRYPTED);
+
+    for (int round = 0; round < 3; round++) {
+        uint32_t tokens[] = {(uint32_t)(round * 10 + 1), (uint32_t)(round * 10 + 2)};
+        char *req = pc_client_prepare_request_json(c, tokens, 2, 50, 700, 42);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "reuse[%d]: request prepared", round);
+        ASSERT(req != NULL, msg);
+
+        uint32_t out[] = {1, 2, 3};
+        char *resp_json = mock_server_response(out, 3);
+        pc_verified_response_t *vr = pc_client_process_response_json(c, resp_json);
+        snprintf(msg, sizeof(msg), "reuse[%d]: response processed", round);
+        ASSERT(vr != NULL, msg);
+        ASSERT_EQ(vr->count, 3, msg);
+
+        pc_verified_response_free(vr);
+        free(resp_json);
+        free(req);
+    }
+
+    pc_client_free(c);
+}
+
+static void test_large_response(void) {
+    /* Stress: process response with 1000 tokens */
+    pc_client_t *c = pc_client_new("test-model", PV_MODE_TRANSPARENT);
+    size_t n = 1000;
+    uint32_t *tokens = malloc(n * sizeof(uint32_t));
+    for (size_t i = 0; i < n; i++) tokens[i] = (uint32_t)(i + 1);
+
+    char *resp_json = mock_server_response(tokens, n);
+    pc_verified_response_t *vr = pc_client_process_response_json(c, resp_json);
+
+    ASSERT(vr != NULL, "large_resp: parsed");
+    ASSERT_EQ(vr->count, n, "large_resp: count = 1000");
+    ASSERT_EQ(vr->token_ids[0], 1, "large_resp: first token");
+    ASSERT_EQ(vr->token_ids[999], 1000, "large_resp: last token");
+
+    /* Disclose a range from the large response */
+    size_t indices[] = {0, 499, 999};
+    pv_disclosure_t *d = pc_verified_response_disclose(vr, indices, 3);
+    ASSERT(d != NULL, "large_resp: disclosure created");
+    ASSERT(pv_disclosure_verify(d), "large_resp: disclosure verifies");
+    ASSERT_EQ(d->proof_count, 3, "large_resp: 3 proofs");
+
+    pv_disclosure_free(d);
+    pc_verified_response_free(vr);
+    free(resp_json);
+    free(tokens);
+    pc_client_free(c);
+}
+
+static void test_single_token_response(void) {
+    pc_client_t *c = pc_client_new("test-model", PV_MODE_PRIVATE_PROVEN);
+    uint32_t tokens[] = {42};
+    char *resp_json = mock_server_response(tokens, 1);
+
+    pc_verified_response_t *vr = pc_client_process_response_json(c, resp_json);
+    ASSERT(vr != NULL, "single_token: parsed");
+    ASSERT_EQ(vr->count, 1, "single_token: count = 1");
+    ASSERT_EQ(vr->token_ids[0], 42, "single_token: token = 42");
+    ASSERT(pc_verified_response_is_verified(vr), "single_token: verified");
+
+    /* Disclose the only token */
+    size_t idx[] = {0};
+    pv_disclosure_t *d = pc_verified_response_disclose(vr, idx, 1);
+    ASSERT(d != NULL, "single_token: disclosure created");
+    ASSERT(pv_disclosure_verify(d), "single_token: disclosure verifies");
+
+    pv_disclosure_free(d);
+    pc_verified_response_free(vr);
+    free(resp_json);
+    pc_client_free(c);
+}
+
+static void test_null_handling(void) {
+    /* NULL json should not crash */
+    pc_client_t *c = pc_client_new("test-model", PV_MODE_TRANSPARENT);
+
+    pc_verified_response_t *vr = pc_client_process_response_json(c, NULL);
+    ASSERT(vr == NULL, "null: NULL json returns NULL");
+
+    pc_client_free(c);
+}
+
 /* ---------- Main ---------- */
 
 int main(void) {
@@ -282,6 +370,10 @@ int main(void) {
     test_invalid_response();
     test_disclosure_range_from_response();
     test_serialization_roundtrip();
+    test_client_reuse();
+    test_large_response();
+    test_single_token_response();
+    test_null_handling();
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

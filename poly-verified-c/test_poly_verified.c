@@ -1127,6 +1127,202 @@ static void test_cross_lang_chain_matches(void) {
     ASSERT(!pv_hash_eq(tip, PV_ZERO_HASH), "cross-lang: 3-step chain non-zero");
 }
 
+/* ============ Integration tests ============ */
+
+static void test_full_pipeline_transparent(void) {
+    /* IVC → finalize → independently rebuild merkle → verify roots match */
+    pv_hash_t code_hash;
+    uint8_t cd[] = "transparent_pipeline";
+    pv_hash_data(cd, 20, code_hash);
+
+    pv_ivc_t *ivc = pv_ivc_new(code_hash, PV_TRANSPARENT);
+    pv_hash_t transitions[3];
+
+    for (uint8_t i = 0; i < 3; i++) {
+        pv_step_witness_t w;
+        pv_hash_data(&i, 1, w.state_before);
+        uint8_t next = i + 1;
+        pv_hash_data(&next, 1, w.state_after);
+        uint8_t inp[2] = {i, i};
+        pv_hash_data(inp, 2, w.step_inputs);
+        pv_ivc_fold_step(ivc, &w);
+        pv_hash_transition(w.state_before, w.step_inputs, w.state_after, transitions[i]);
+    }
+
+    pv_proof_t *proof = pv_ivc_finalize(ivc);
+    ASSERT(proof != NULL, "pipeline_t: finalize");
+    ASSERT_EQ(proof->step_count, 3, "pipeline_t: step_count = 3");
+    ASSERT(!pv_hash_eq(proof->chain_tip, PV_ZERO_HASH), "pipeline_t: chain_tip non-zero");
+    ASSERT(!pv_hash_eq(proof->merkle_root, PV_ZERO_HASH), "pipeline_t: merkle_root non-zero");
+    ASSERT(pv_hash_eq(proof->code_hash, code_hash), "pipeline_t: code_hash matches");
+
+    /* Independently rebuild merkle tree from same transitions */
+    for (uint64_t i = 0; i < 3; i++) {
+        pv_merkle_proof_t *mp = pv_merkle_build_and_prove(transitions, 3, i, code_hash);
+        ASSERT(mp != NULL, "pipeline_t: merkle proof built");
+        ASSERT(pv_merkle_verify(mp), "pipeline_t: merkle proof verifies");
+        ASSERT(pv_hash_eq(mp->root, proof->merkle_root), "pipeline_t: merkle root matches proof");
+        pv_merkle_proof_free(mp);
+    }
+
+    pv_proof_free(proof);
+}
+
+static void test_full_pipeline_private(void) {
+    /* Private mode: blinding present, code_hash hidden */
+    pv_hash_t code_hash;
+    uint8_t cd[] = "private_pipeline";
+    pv_hash_data(cd, 16, code_hash);
+
+    pv_ivc_t *ivc = pv_ivc_new(code_hash, PV_PRIVATE);
+    for (uint8_t i = 0; i < 3; i++) {
+        pv_step_witness_t w;
+        make_witness(&w, i);
+        pv_ivc_fold_step(ivc, &w);
+    }
+
+    pv_proof_t *proof = pv_ivc_finalize(ivc);
+    ASSERT(proof != NULL, "pipeline_p: finalize");
+    ASSERT_EQ(proof->has_blinding, 1, "pipeline_p: has blinding");
+    ASSERT(!pv_hash_eq(proof->blinding_commitment, PV_ZERO_HASH), "pipeline_p: blinding non-zero");
+    ASSERT_EQ(proof->privacy, PV_PRIVATE, "pipeline_p: private mode");
+
+    /* JSON roundtrip preserves private mode fields */
+    char *wire = pv_proof_to_wire_json(proof);
+    ASSERT(wire != NULL, "pipeline_p: wire JSON");
+    ASSERT(strstr(wire, "blinding_commitment") != NULL, "pipeline_p: blinding in JSON");
+
+    pv_proof_t *parsed = pv_proof_from_wire_json(wire);
+    ASSERT(parsed != NULL, "pipeline_p: parse back");
+    ASSERT_EQ(parsed->privacy, PV_PRIVATE, "pipeline_p: privacy roundtrip");
+    ASSERT_EQ(parsed->has_blinding, 1, "pipeline_p: has_blinding roundtrip");
+    ASSERT(pv_hash_eq(parsed->blinding_commitment, proof->blinding_commitment),
+           "pipeline_p: blinding roundtrip");
+
+    free(wire);
+    pv_proof_free(parsed);
+    pv_proof_free(proof);
+}
+
+static void test_full_pipeline_disclosure(void) {
+    /* End-to-end: IVC → disclosure → verify */
+    pv_hash_t code_hash = {0x10};
+    pv_ivc_t *ivc = pv_ivc_new(code_hash, PV_TRANSPARENT);
+    pv_step_witness_t w;
+    make_witness(&w, 1);
+    pv_ivc_fold_step(ivc, &w);
+    pv_proof_t *proof = pv_ivc_finalize(ivc);
+
+    uint32_t tokens[] = {10, 20, 30, 40, 50, 60, 70, 80};
+
+    /* Disclose subset for "pharmacist" */
+    size_t pharm_idx[] = {1, 2, 3};
+    pv_disclosure_t *pharm = pv_disclosure_create(tokens, 8, proof, pharm_idx, 3);
+    ASSERT(pharm != NULL, "pipeline_d: pharmacist created");
+    ASSERT(pv_disclosure_verify(pharm), "pipeline_d: pharmacist verifies");
+    ASSERT_EQ(pharm->proof_count, 3, "pipeline_d: pharmacist proof_count");
+
+    /* Disclose different subset for "insurer" */
+    size_t ins_idx[] = {6};
+    pv_disclosure_t *ins = pv_disclosure_create(tokens, 8, proof, ins_idx, 1);
+    ASSERT(ins != NULL, "pipeline_d: insurer created");
+    ASSERT(pv_disclosure_verify(ins), "pipeline_d: insurer verifies");
+
+    /* Same output root for both audiences */
+    ASSERT(pv_hash_eq(pharm->output_root, ins->output_root), "pipeline_d: same root");
+
+    pv_disclosure_free(pharm);
+    pv_disclosure_free(ins);
+    pv_proof_free(proof);
+}
+
+static void test_merkle_empty(void) {
+    pv_hash_t code_hash = {0};
+    pv_merkle_proof_t *p = pv_merkle_build_and_prove(NULL, 0, 0, code_hash);
+    ASSERT(p == NULL, "merkle: empty tree returns NULL");
+}
+
+static void test_merkle_all_indices(void) {
+    /* Build 8-leaf tree, verify proof at every index, all share same root */
+    size_t n = 8;
+    pv_hash_t leaves[8], code_hash = {0x55};
+    for (size_t i = 0; i < n; i++) {
+        uint8_t d[4] = {(uint8_t)i, 0x77, 0, 0};
+        pv_hash_leaf(d, 4, leaves[i]);
+    }
+
+    pv_hash_t first_root;
+    for (size_t i = 0; i < n; i++) {
+        pv_merkle_proof_t *p = pv_merkle_build_and_prove(leaves, n, i, code_hash);
+        ASSERT(p != NULL, "merkle_all: proof built");
+        ASSERT(pv_merkle_verify(p), "merkle_all: proof verifies");
+        ASSERT_EQ(p->leaf_index, i, "merkle_all: correct leaf_index");
+        ASSERT(pv_hash_eq(p->leaf, leaves[i]), "merkle_all: correct leaf hash");
+        if (i == 0) memcpy(first_root, p->root, 32);
+        else ASSERT(pv_hash_eq(p->root, first_root), "merkle_all: consistent root");
+        pv_merkle_proof_free(p);
+    }
+}
+
+static void test_json_private_mode_zeroes_code_hash(void) {
+    /* In private mode, human-readable JSON should show zeroed code_hash */
+    pv_hash_t code_hash;
+    uint8_t cd[] = "secret_code";
+    pv_hash_data(cd, 11, code_hash);
+
+    pv_ivc_t *ivc = pv_ivc_new(code_hash, PV_PRIVATE);
+    pv_step_witness_t w;
+    make_witness(&w, 99);
+    pv_ivc_fold_step(ivc, &w);
+    pv_proof_t *proof = pv_ivc_finalize(ivc);
+
+    char *json = pv_proof_to_json(proof);
+    ASSERT(json != NULL, "json_private: serialize");
+    ASSERT(strstr(json, "\"privacy_mode\":\"Private\"") != NULL ||
+           strstr(json, "Private") != NULL, "json_private: mode present");
+    ASSERT(strstr(json, "blinding") != NULL, "json_private: blinding present");
+
+    free(json);
+    pv_proof_free(proof);
+}
+
+static void test_wire_json_field_validation(void) {
+    /* Build proof with known values, marshal to wire, parse back, validate every field */
+    pv_hash_t code_hash;
+    for (int i = 0; i < 32; i++) code_hash[i] = (uint8_t)(i * 3 % 256);
+
+    pv_ivc_t *ivc = pv_ivc_new(code_hash, PV_PRIVATE_INPUTS);
+    for (int i = 0; i < 5; i++) {
+        pv_step_witness_t w;
+        make_witness(&w, (uint8_t)i);
+        pv_ivc_fold_step(ivc, &w);
+    }
+    pv_proof_t *original = pv_ivc_finalize(ivc);
+
+    char *wire = pv_proof_to_wire_json(original);
+    ASSERT(wire != NULL, "wire_fields: serialize");
+
+    pv_proof_t *parsed = pv_proof_from_wire_json(wire);
+    ASSERT(parsed != NULL, "wire_fields: parse");
+    ASSERT_EQ(parsed->step_count, 5, "wire_fields: step_count");
+    ASSERT_EQ(parsed->privacy, PV_PRIVATE_INPUTS, "wire_fields: privacy mode");
+    ASSERT(pv_hash_eq(parsed->chain_tip, original->chain_tip), "wire_fields: chain_tip");
+    ASSERT(pv_hash_eq(parsed->merkle_root, original->merkle_root), "wire_fields: merkle_root");
+    ASSERT(pv_hash_eq(parsed->code_hash, original->code_hash), "wire_fields: code_hash");
+
+    /* Verify individual bytes of chain_tip to catch byte-order issues */
+    for (int i = 0; i < 32; i++) {
+        if (parsed->chain_tip[i] != original->chain_tip[i]) {
+            ASSERT(0, "wire_fields: chain_tip byte mismatch");
+            break;
+        }
+    }
+
+    free(wire);
+    pv_proof_free(parsed);
+    pv_proof_free(original);
+}
+
 /* ============ Main ============ */
 
 int main(void) {
@@ -1201,6 +1397,15 @@ int main(void) {
     test_json_with_blinding();
     test_json_human_readable();
     test_json_invalid_input();
+
+    /* Integration tests */
+    test_full_pipeline_transparent();
+    test_full_pipeline_private();
+    test_full_pipeline_disclosure();
+    test_merkle_empty();
+    test_merkle_all_indices();
+    test_json_private_mode_zeroes_code_hash();
+    test_wire_json_field_validation();
 
     /* Cross-language compatibility */
     test_cross_lang_token_leaf();

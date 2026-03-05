@@ -133,6 +133,7 @@ char *pc_client_prepare_request_json(pc_client_t *client,
 
 /* Extract a JSON object value starting at a key (returns pointer into json) */
 static const char *find_json_object(const char *json, const char *key) {
+    if (!json) return NULL;
     char needle[128];
     snprintf(needle, sizeof(needle), "\"%s\"", key);
     const char *p = strstr(json, needle);
